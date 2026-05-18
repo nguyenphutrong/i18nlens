@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use regex::Regex;
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,14 @@ impl KeyFinder {
             }
         }
 
+        let scoped_keys = Self::find_next_intl_scoped_keys(content);
+        if !scoped_keys.is_empty() {
+            let scoped_offsets: HashSet<usize> =
+                scoped_keys.iter().map(|key| key.start_offset).collect();
+            found_keys.retain(|key| !scoped_offsets.contains(&key.start_offset));
+            found_keys.extend(scoped_keys);
+        }
+
         found_keys.sort_by_key(|k| k.start_offset);
         found_keys.dedup_by(|a, b| a.start_offset == b.start_offset);
         found_keys
@@ -86,6 +96,65 @@ impl KeyFinder {
         let end_char = end_offset - line_start;
 
         (line, start_char, end_char)
+    }
+
+    fn find_next_intl_scoped_keys(content: &str) -> Vec<FoundKey> {
+        let Ok(translator_regex) = Regex::new(
+            r#"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:useTranslations|getTranslations)\s*\(\s*["']([^"']+)["']\s*\)"#,
+        ) else {
+            return Vec::new();
+        };
+
+        let mut found_keys = Vec::new();
+
+        for translator in translator_regex.captures_iter(content) {
+            let Some(variable_match) = translator.get(1) else {
+                continue;
+            };
+            let Some(namespace_match) = translator.get(2) else {
+                continue;
+            };
+
+            let variable = variable_match.as_str();
+            let namespace = namespace_match.as_str();
+            if namespace.is_empty() {
+                continue;
+            }
+
+            let call_pattern = format!(
+                r#"(?:^|[^\w.]){}(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#,
+                regex::escape(variable)
+            );
+            let Ok(call_regex) = Regex::new(&call_pattern) else {
+                continue;
+            };
+
+            let declaration_end = translator.get(0).map(|m| m.end()).unwrap_or(0);
+            for call in call_regex.captures_iter(content) {
+                let Some(key_match) = call.get(1) else {
+                    continue;
+                };
+                if key_match.start() < declaration_end {
+                    continue;
+                }
+
+                let key = format!("{}.{}", namespace, key_match.as_str());
+                let start_offset = key_match.start();
+                let end_offset = key_match.end();
+                let (line, start_char, end_char) =
+                    Self::offset_to_position(content, start_offset, end_offset);
+
+                found_keys.push(FoundKey {
+                    key,
+                    start_offset,
+                    line,
+                    start_char,
+                    end_char,
+                });
+            }
+        }
+
+        found_keys
     }
 }
 
@@ -139,6 +208,49 @@ mod tests {
         let keys = finder.find_keys(content);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "hello.world");
+    }
+
+    #[test]
+    fn test_find_next_intl_namespaced_key() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            import { useTranslations } from "next-intl";
+            const t = useTranslations("Landing.Contact");
+            const selectPlaceholder = t("SelectPlaceholder");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Contact.SelectPlaceholder");
+    }
+
+    #[test]
+    fn test_find_next_intl_namespaced_key_with_custom_translator_name() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const contactT = useTranslations("Landing.Contact");
+            const selectPlaceholder = contactT("SelectPlaceholder");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Contact.SelectPlaceholder");
+    }
+
+    #[test]
+    fn test_find_next_intl_namespaced_rich_key() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = useTranslations("Landing.Contact");
+            const label = t.rich("SelectLabel", {strong: (chunks) => <strong>{chunks}</strong>});
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Contact.SelectLabel");
     }
 
     #[test]
