@@ -1,6 +1,6 @@
 id = "i18nlens"
 name = "I18n Lens"
-version = "0.1.8"
+version = "0.1.9"
 schema_version = 1
 license = "MIT"
 authors = ["Trong Nguyen"]
