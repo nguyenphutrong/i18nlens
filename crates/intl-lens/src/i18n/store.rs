@@ -24,6 +24,7 @@ pub struct TranslationStore {
     translations: DashMap<String, HashMap<String, TranslationEntry>>,
     locale_files: DashMap<String, HashSet<PathBuf>>,
     workspace_root: PathBuf,
+    namespace_enabled: bool,
 }
 
 impl TranslationStore {
@@ -32,7 +33,16 @@ impl TranslationStore {
             translations: DashMap::new(),
             locale_files: DashMap::new(),
             workspace_root,
+            namespace_enabled: false,
         }
+    }
+
+    /// When enabled, JSON/YAML locale files nested as `<namespace>/<locale-dir>/<locale>.json`
+    /// (e.g. `features/landing/locales/en.json`) get their keys prefixed with `<namespace>`,
+    /// matching how `useTranslations("<namespace>")`-scoped keys are resolved by the key finder.
+    pub fn with_namespace_enabled(mut self, enabled: bool) -> Self {
+        self.namespace_enabled = enabled;
+        self
     }
 
     pub fn scan_and_load(&self, locale_paths: &[String]) {
@@ -148,21 +158,46 @@ impl TranslationStore {
         None
     }
 
+    /// For `<namespace>/<locale-dir>/<locale>.json`-style layouts (e.g. feature-colocated
+    /// `features/landing/locales/en.json`), the namespace is the directory one level above
+    /// the file's own directory. Only applied when `namespace_enabled` is set, since a bare
+    /// `locales/en.json` layout has no such namespace segment to derive.
+    fn locale_namespace_prefix(&self, path: &Path) -> Option<String> {
+        if !self.namespace_enabled {
+            return None;
+        }
+
+        let locale_dir = path.parent()?;
+        let namespace_dir = locale_dir.parent()?;
+        if namespace_dir == self.workspace_root {
+            return None;
+        }
+
+        let namespace = namespace_dir.file_name()?.to_str()?;
+        if namespace.is_empty() {
+            return None;
+        }
+
+        Some(namespace.to_string())
+    }
+
     fn load_translation_file(&self, path: &Path, locale: &str) {
         match TranslationParser::parse_file(path) {
             Ok(translations) => {
                 let mut locale_map = self.translations.entry(locale.to_string()).or_default();
                 let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                let prefix =
-                    if extension == "php" && !file_stem.is_empty() && !is_locale_code(file_stem) {
-                        Some(file_stem)
-                    } else {
-                        None
-                    };
+                let prefix = if extension == "php"
+                    && !file_stem.is_empty()
+                    && !is_locale_code(file_stem)
+                {
+                    Some(file_stem.to_string())
+                } else {
+                    self.locale_namespace_prefix(path)
+                };
 
                 for (key, value) in translations {
-                    let full_key = match prefix {
+                    let full_key = match &prefix {
                         Some(prefix) => format!("{}.{}", prefix, key),
                         None => key,
                     };
@@ -384,6 +419,47 @@ mod tests {
             store.get_translation("foo.greeting", "en").as_deref(),
             Some("Hello from layer")
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn namespace_enabled_prefixes_keys_with_feature_folder_name() {
+        let root = test_workspace("namespace-enabled");
+        let locale_dir = root.join("features/landing/locales");
+        fs::create_dir_all(&locale_dir).expect("create locale dir");
+        fs::write(
+            locale_dir.join("en.json"),
+            r#"{"features":{"items":{"loans":{"title":"End-to-end loan management"}}}}"#,
+        )
+        .expect("write en locale");
+
+        let store =
+            TranslationStore::new(root.clone()).with_namespace_enabled(true);
+        store.scan_and_load(&["features/*/locales".to_string()]);
+
+        assert_eq!(
+            store
+                .get_translation("landing.features.items.loans.title", "en")
+                .as_deref(),
+            Some("End-to-end loan management")
+        );
+        assert!(store.get_translation("features.items.loans.title", "en").is_none());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn namespace_disabled_leaves_keys_unprefixed() {
+        let root = test_workspace("namespace-disabled");
+        let locale_dir = root.join("features/landing/locales");
+        fs::create_dir_all(&locale_dir).expect("create locale dir");
+        fs::write(locale_dir.join("en.json"), r#"{"hello":"Hi"}"#).expect("write en locale");
+
+        let store = TranslationStore::new(root.clone());
+        store.scan_and_load(&["features/*/locales".to_string()]);
+
+        assert_eq!(store.get_translation("hello", "en").as_deref(), Some("Hi"));
 
         fs::remove_dir_all(root).ok();
     }

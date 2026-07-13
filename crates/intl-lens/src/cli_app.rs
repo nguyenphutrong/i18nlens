@@ -330,7 +330,8 @@ async fn run_audit(
     let config = I18nConfig::load_from_workspace(workspace);
 
     pb.set_message("Scanning translation files...");
-    let store = TranslationStore::new(workspace.to_path_buf());
+    let store = TranslationStore::new(workspace.to_path_buf())
+        .with_namespace_enabled(config.namespace_enabled);
     store.scan_and_load(&config.locale_paths);
 
     pb.set_message("Scanning codebase...");
@@ -599,7 +600,8 @@ async fn run_check(
         }
     }
 
-    let store = TranslationStore::new(workspace.to_path_buf());
+    let store = TranslationStore::new(workspace.to_path_buf())
+        .with_namespace_enabled(config.namespace_enabled);
     store.scan_and_load(&config.locale_paths);
 
     let mut missing = Vec::new();
@@ -719,7 +721,8 @@ async fn run_fix(
     placeholder: Option<String>,
 ) -> anyhow::Result<i32> {
     let config = I18nConfig::load_from_workspace(workspace);
-    let store = TranslationStore::new(workspace.to_path_buf());
+    let store = TranslationStore::new(workspace.to_path_buf())
+        .with_namespace_enabled(config.namespace_enabled);
     store.scan_and_load(&config.locale_paths);
 
     let mut result = AuditResult::new(workspace.to_path_buf(), config.clone(), store);
