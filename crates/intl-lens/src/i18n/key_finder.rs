@@ -15,6 +15,19 @@ pub struct KeyFinder {
     patterns: Vec<Regex>,
 }
 
+/// A next-intl translator declaration (`const t = useTranslations(...)`) with
+/// the lexical scope over which it is visible.
+struct Declaration {
+    /// Byte offset just past the declaration; call sites must appear at or
+    /// after this to bind to it.
+    declaration_end: usize,
+    /// Byte offset of the enclosing block's closing brace — the end of the
+    /// declaration's lexical scope.
+    scope_end: usize,
+    /// Resolved namespace, empty for an unscoped translator.
+    namespace: String,
+}
+
 impl KeyFinder {
     pub fn new(patterns: &[String]) -> Self {
         let compiled_patterns: Vec<Regex> =
@@ -98,6 +111,30 @@ impl KeyFinder {
         (line, start_char, end_char)
     }
 
+    /// Byte offset of the closing brace of the block enclosing `from`, i.e.
+    /// the point where a declaration made at `from` goes out of scope. Scans
+    /// forward tracking brace depth and returns the first `}` seen at depth
+    /// zero; declarations at module top level (no enclosing block) scope to the
+    /// end of the file. Braces inside strings or comments are not distinguished
+    /// — a deliberately shallow heuristic matching the regex-based approach
+    /// used elsewhere here.
+    fn enclosing_block_end(content: &str, from: usize) -> usize {
+        let mut depth = 0usize;
+        for (offset, byte) in content.bytes().enumerate().skip(from) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        return offset;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        content.len()
+    }
+
     fn find_next_intl_translator_keys(content: &str) -> Vec<FoundKey> {
         // Matches translator declarations with a string namespace, an object
         // argument (e.g. `getTranslations({ locale, namespace: "X" })`), or no
@@ -114,8 +151,13 @@ impl KeyFinder {
         // Collect declarations grouped by variable name. The same variable is
         // often redeclared per component in one file, possibly with different
         // namespaces, so each call site must resolve against the nearest
-        // preceding declaration rather than every declaration.
-        let mut translators: Vec<(&str, Vec<(usize, String)>)> = Vec::new();
+        // preceding declaration *that is still in scope* rather than every
+        // declaration. Each declaration carries the byte offset of its
+        // enclosing block's closing brace (`scope_end`); a call is only bound
+        // to a declaration when it falls within that lexical scope. This keeps
+        // a `const t = useTranslations("Header")` in one component from
+        // capturing a `t` received via props in a later component.
+        let mut translators: Vec<(&str, Vec<Declaration>)> = Vec::new();
         for translator in translator_regex.captures_iter(content) {
             let Some(variable_match) = translator.get(1) else {
                 continue;
@@ -134,10 +176,16 @@ impl KeyFinder {
                 })
                 .unwrap_or_default();
             let declaration_end = translator.get(0).map(|m| m.end()).unwrap_or(0);
+            let scope_end = Self::enclosing_block_end(content, declaration_end);
+            let declaration = Declaration {
+                declaration_end,
+                scope_end,
+                namespace,
+            };
 
             match translators.iter_mut().find(|(v, _)| *v == variable) {
-                Some((_, declarations)) => declarations.push((declaration_end, namespace)),
-                None => translators.push((variable, vec![(declaration_end, namespace)])),
+                Some((_, declarations)) => declarations.push(declaration),
+                None => translators.push((variable, vec![declaration])),
             }
         }
 
@@ -157,15 +205,18 @@ impl KeyFinder {
                     continue;
                 };
 
-                // Nearest declaration of this variable before the call site;
-                // declarations are already in document order.
-                let Some((_, namespace)) = declarations
-                    .iter()
-                    .rev()
-                    .find(|(declaration_end, _)| *declaration_end <= key_match.start())
-                else {
+                // Nearest declaration of this variable that precedes the call
+                // site *and* whose lexical scope still covers it. When none
+                // qualifies (e.g. the translator was received via props), the
+                // call is left to the generic unscoped pattern, which reports
+                // the literal (full) key.
+                let call_start = key_match.start();
+                let Some(declaration) = declarations.iter().rev().find(|decl| {
+                    decl.declaration_end <= call_start && call_start <= decl.scope_end
+                }) else {
                     continue;
                 };
+                let namespace = &declaration.namespace;
 
                 let key = if namespace.is_empty() {
                     key_match.as_str().to_string()
@@ -452,6 +503,75 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].key, "Events.Rewards.Title");
         assert_eq!(keys[1].key, "Events.Rules.Heading");
+    }
+
+    #[test]
+    fn test_scoped_translator_does_not_leak_to_props_translator_in_later_component() {
+        let finder = KeyFinder::default();
+        // `Body` receives `t` via props; the scoped `t` in the earlier `Header`
+        // component must not leak across the function boundary, so the props
+        // call resolves as the literal (unscoped) key.
+        let content = r#"
+            function Header() {
+                const t = useTranslations("Header");
+                return <h1>{t("Title")}</h1>;
+            }
+
+            function Body({ t }) {
+                return <p>{t.rich("Page.Body", {b: (c) => <b>{c}</b>})}</p>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Header.Title");
+        assert_eq!(keys[1].key, "Page.Body");
+    }
+
+    #[test]
+    fn test_scoped_translator_does_not_leak_backwards_regardless_of_source_order() {
+        let finder = KeyFinder::default();
+        // Same as above but the props component appears *before* the scoped
+        // declaration. Byte-offset proximity is irrelevant; only lexical scope
+        // decides, so the props call stays unscoped.
+        let content = r#"
+            function Body({ t }) {
+                return <p>{t.rich("Page.Body", {b: (c) => <b>{c}</b>})}</p>;
+            }
+
+            function Header() {
+                const t = useTranslations("Header");
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Page.Body");
+        assert_eq!(keys[1].key, "Header.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_covers_nested_block_within_its_component() {
+        let finder = KeyFinder::default();
+        // A call nested inside an inner block of the same component must still
+        // resolve against the component's scoped translator.
+        let content = r#"
+            function Hero({ show }) {
+                const t = useTranslations("Landing.Hero");
+                if (show) {
+                    return <h1>{t.rich("Title", {b: (c) => <b>{c}</b>})}</h1>;
+                }
+                return null;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
     }
 
     #[test]
