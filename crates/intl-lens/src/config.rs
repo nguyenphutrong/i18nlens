@@ -133,8 +133,8 @@ fn default_key_style() -> KeyStyle {
 fn default_function_patterns() -> Vec<String> {
     vec![
         // JavaScript/TypeScript patterns
-        // Match t() but not .post(), .get(), .put(), .delete(), etc.
-        r#"(?:^|[^\w.])t\s*\(\s*["']([^"']+)["']"#.to_string(),
+        // Match t()/t.rich()/t.markup()/t.raw()/t.has() but not .post(), .get(), etc.
+        r#"(?:^|[^\w.])t(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"i18n\.t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"useTranslation\s*\(\s*\)\s*.*?t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$t\s*\(\s*["']([^"']+)["']"#.to_string(),

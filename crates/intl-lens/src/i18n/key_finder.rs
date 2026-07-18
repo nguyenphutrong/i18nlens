@@ -15,6 +15,19 @@ pub struct KeyFinder {
     patterns: Vec<Regex>,
 }
 
+/// A next-intl translator declaration (`const t = useTranslations(...)`) with
+/// the lexical scope over which it is visible.
+struct Declaration {
+    /// Byte offset just past the declaration; call sites must appear at or
+    /// after this to bind to it.
+    declaration_end: usize,
+    /// Byte offset of the enclosing block's closing brace — the end of the
+    /// declaration's lexical scope.
+    scope_end: usize,
+    /// Resolved namespace, empty for an unscoped translator.
+    namespace: String,
+}
+
 impl KeyFinder {
     pub fn new(patterns: &[String]) -> Self {
         let compiled_patterns: Vec<Regex> =
@@ -49,7 +62,7 @@ impl KeyFinder {
             }
         }
 
-        let scoped_keys = Self::find_next_intl_scoped_keys(content);
+        let scoped_keys = Self::find_next_intl_translator_keys(content);
         if !scoped_keys.is_empty() {
             let scoped_offsets: HashSet<usize> =
                 scoped_keys.iter().map(|key| key.start_offset).collect();
@@ -98,29 +111,87 @@ impl KeyFinder {
         (line, start_char, end_char)
     }
 
-    fn find_next_intl_scoped_keys(content: &str) -> Vec<FoundKey> {
+    /// Byte offset of the closing brace of the block enclosing `from`, i.e.
+    /// the point where a declaration made at `from` goes out of scope. Scans
+    /// forward tracking brace depth and returns the first `}` seen at depth
+    /// zero; declarations at module top level (no enclosing block) scope to the
+    /// end of the file. Braces inside strings or comments are not distinguished
+    /// — a deliberately shallow heuristic matching the regex-based approach
+    /// used elsewhere here.
+    fn enclosing_block_end(content: &str, from: usize) -> usize {
+        let mut depth = 0usize;
+        for (offset, byte) in content.bytes().enumerate().skip(from) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        return offset;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        content.len()
+    }
+
+    fn find_next_intl_translator_keys(content: &str) -> Vec<FoundKey> {
+        // Matches translator declarations with a string namespace, an object
+        // argument (e.g. `getTranslations({ locale, namespace: "X" })`), or no
+        // argument at all (unscoped translator called with full keys).
         let Ok(translator_regex) = Regex::new(
-            r#"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:useTranslations|getTranslations)\s*\(\s*["']([^"']+)["']\s*\)"#,
+            r#"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:useTranslations|getTranslations)\s*\(\s*(?:["']([^"']*)["']|(\{[^{}]*\}))?\s*\)"#,
         ) else {
             return Vec::new();
         };
+        let Ok(namespace_prop_regex) = Regex::new(r#"namespace\s*:\s*["']([^"']+)["']"#) else {
+            return Vec::new();
+        };
 
-        let mut found_keys = Vec::new();
-
+        // Collect declarations grouped by variable name. The same variable is
+        // often redeclared per component in one file, possibly with different
+        // namespaces, so each call site must resolve against the nearest
+        // preceding declaration *that is still in scope* rather than every
+        // declaration. Each declaration carries the byte offset of its
+        // enclosing block's closing brace (`scope_end`); a call is only bound
+        // to a declaration when it falls within that lexical scope. This keeps
+        // a `const t = useTranslations("Header")` in one component from
+        // capturing a `t` received via props in a later component.
+        let mut translators: Vec<(&str, Vec<Declaration>)> = Vec::new();
         for translator in translator_regex.captures_iter(content) {
             let Some(variable_match) = translator.get(1) else {
                 continue;
             };
-            let Some(namespace_match) = translator.get(2) else {
-                continue;
-            };
 
             let variable = variable_match.as_str();
-            let namespace = namespace_match.as_str();
-            if namespace.is_empty() {
-                continue;
-            }
+            let namespace = translator
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .or_else(|| {
+                    translator.get(3).and_then(|object_arg| {
+                        namespace_prop_regex
+                            .captures(object_arg.as_str())
+                            .map(|cap| cap[1].to_string())
+                    })
+                })
+                .unwrap_or_default();
+            let declaration_end = translator.get(0).map(|m| m.end()).unwrap_or(0);
+            let scope_end = Self::enclosing_block_end(content, declaration_end);
+            let declaration = Declaration {
+                declaration_end,
+                scope_end,
+                namespace,
+            };
 
+            match translators.iter_mut().find(|(v, _)| *v == variable) {
+                Some((_, declarations)) => declarations.push(declaration),
+                None => translators.push((variable, vec![declaration])),
+            }
+        }
+
+        let mut found_keys = Vec::new();
+
+        for (variable, declarations) in translators {
             let call_pattern = format!(
                 r#"(?:^|[^\w.]){}(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#,
                 regex::escape(variable)
@@ -129,16 +200,29 @@ impl KeyFinder {
                 continue;
             };
 
-            let declaration_end = translator.get(0).map(|m| m.end()).unwrap_or(0);
             for call in call_regex.captures_iter(content) {
                 let Some(key_match) = call.get(1) else {
                     continue;
                 };
-                if key_match.start() < declaration_end {
-                    continue;
-                }
 
-                let key = format!("{}.{}", namespace, key_match.as_str());
+                // Nearest declaration of this variable that precedes the call
+                // site *and* whose lexical scope still covers it. When none
+                // qualifies (e.g. the translator was received via props), the
+                // call is left to the generic unscoped pattern, which reports
+                // the literal (full) key.
+                let call_start = key_match.start();
+                let Some(declaration) = declarations.iter().rev().find(|decl| {
+                    decl.declaration_end <= call_start && call_start <= decl.scope_end
+                }) else {
+                    continue;
+                };
+                let namespace = &declaration.namespace;
+
+                let key = if namespace.is_empty() {
+                    key_match.as_str().to_string()
+                } else {
+                    format!("{}.{}", namespace, key_match.as_str())
+                };
                 let start_offset = key_match.start();
                 let end_offset = key_match.end();
                 let (line, start_char, end_char) =
@@ -167,8 +251,8 @@ impl Default for KeyFinder {
 fn default_patterns() -> Vec<String> {
     vec![
         // JavaScript/TypeScript patterns
-        // Match t() but not .post(), .get(), .put(), .delete(), etc.
-        r#"(?:^|[^\w.])t\s*\(\s*["']([^"']+)["']"#.to_string(),
+        // Match t()/t.rich()/t.markup()/t.raw()/t.has() but not .post(), .get(), etc.
+        r#"(?:^|[^\w.])t(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"i18n\.t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$tc\s*\(\s*["']([^"']+)["']"#.to_string(),
@@ -251,6 +335,243 @@ mod tests {
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "Landing.Contact.SelectLabel");
+    }
+
+    #[test]
+    fn test_find_next_intl_unscoped_rich_key() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = useTranslations();
+            const label = t.rich("Auth.Login.GoToDiscord", {a: (chunks) => <a>{chunks}</a>});
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Auth.Login.GoToDiscord");
+    }
+
+    #[test]
+    fn test_find_next_intl_unscoped_custom_translator_name() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const tRoot = useTranslations();
+            const title = tRoot("App.Hub.Title");
+            const label = tRoot.rich("App.Hub.Label", {b: (chunks) => <b>{chunks}</b>});
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "App.Hub.Title");
+        assert_eq!(keys[1].key, "App.Hub.Label");
+    }
+
+    #[test]
+    fn test_find_next_intl_get_translations_object_arg_unscoped() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = await getTranslations({ locale });
+            const title = t("Landing.Features.Title");
+            const desc = t.rich("Landing.Features.Description", {strong: (c) => <strong>{c}</strong>});
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Landing.Features.Title");
+        assert_eq!(keys[1].key, "Landing.Features.Description");
+    }
+
+    #[test]
+    fn test_find_next_intl_get_translations_object_arg_with_namespace() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = await getTranslations({ locale, namespace: "Landing.Hero" });
+            const title = t("Title");
+            const tagline = t.rich("Tagline", {em: (c) => <em>{c}</em>});
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+        assert_eq!(keys[1].key, "Landing.Hero.Tagline");
+    }
+
+    #[test]
+    fn test_find_next_intl_get_translations_multiline_object_arg() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = await getTranslations({
+                locale,
+                namespace: "Landing.Hero",
+            });
+            const title = t("Title");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_find_rich_key_without_translator_declaration() {
+        // `t` received via props/params, no declaration in this file.
+        let finder = KeyFinder::default();
+        let content = r#"
+            export function Headline({ t }) {
+                return <h1>{t.rich("Landing.Hero.HeadlineFull", {highlight: (c) => <span>{c}</span>})}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.HeadlineFull");
+    }
+
+    #[test]
+    fn test_find_next_intl_multiline_rich_call() {
+        let finder = KeyFinder::default();
+        let content = "
+            const t = useTranslations(\"Events.WinPopup\");
+            const body = t.rich(
+                \"BodyNoCoupon\",
+                { strong: (c) => <strong>{c}</strong> },
+            );
+        ";
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Events.WinPopup.BodyNoCoupon");
+    }
+
+    #[test]
+    fn test_should_not_match_rich_on_other_objects() {
+        let finder = KeyFinder::default();
+        // `.rich` on identifiers other than a translator must not match.
+        let content = r#"
+            editor.rich("some.setting");
+            format.rich("other.value");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn test_find_next_intl_mixed_unscoped_and_scoped_same_variable() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Breadcrumbs() {
+                const t = useTranslations();
+                const home = t("App.Nav.Home");
+            }
+            function Hero() {
+                const t = useTranslations("Landing.Hero");
+                const title = t("Title");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "App.Nav.Home");
+        assert_eq!(keys[1].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_find_next_intl_same_variable_different_namespaces() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Rewards() {
+                const t = useTranslations("Events.Rewards");
+                const title = t("Title");
+            }
+            function Rules() {
+                const t = useTranslations("Events.Rules");
+                const heading = t.rich("Heading", {b: (c) => <b>{c}</b>});
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Events.Rewards.Title");
+        assert_eq!(keys[1].key, "Events.Rules.Heading");
+    }
+
+    #[test]
+    fn test_scoped_translator_does_not_leak_to_props_translator_in_later_component() {
+        let finder = KeyFinder::default();
+        // `Body` receives `t` via props; the scoped `t` in the earlier `Header`
+        // component must not leak across the function boundary, so the props
+        // call resolves as the literal (unscoped) key.
+        let content = r#"
+            function Header() {
+                const t = useTranslations("Header");
+                return <h1>{t("Title")}</h1>;
+            }
+
+            function Body({ t }) {
+                return <p>{t.rich("Page.Body", {b: (c) => <b>{c}</b>})}</p>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Header.Title");
+        assert_eq!(keys[1].key, "Page.Body");
+    }
+
+    #[test]
+    fn test_scoped_translator_does_not_leak_backwards_regardless_of_source_order() {
+        let finder = KeyFinder::default();
+        // Same as above but the props component appears *before* the scoped
+        // declaration. Byte-offset proximity is irrelevant; only lexical scope
+        // decides, so the props call stays unscoped.
+        let content = r#"
+            function Body({ t }) {
+                return <p>{t.rich("Page.Body", {b: (c) => <b>{c}</b>})}</p>;
+            }
+
+            function Header() {
+                const t = useTranslations("Header");
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Page.Body");
+        assert_eq!(keys[1].key, "Header.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_covers_nested_block_within_its_component() {
+        let finder = KeyFinder::default();
+        // A call nested inside an inner block of the same component must still
+        // resolve against the component's scoped translator.
+        let content = r#"
+            function Hero({ show }) {
+                const t = useTranslations("Landing.Hero");
+                if (show) {
+                    return <h1>{t.rich("Title", {b: (c) => <b>{c}</b>})}</h1>;
+                }
+                return null;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
     }
 
     #[test]
