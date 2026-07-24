@@ -17,7 +17,7 @@ The Zed extension remains an important distribution channel, but the product sho
 
 ## Current State
 
-Workspace version: `0.1.9`
+Workspace version: `0.1.10`
 
 | Area | Status | Notes |
 |------|--------|-------|

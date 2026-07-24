@@ -1,6 +1,6 @@
 {
   "name": "@i18nlens/cli",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "I18n intelligence layer for codebases",
   "license": "MIT",
   "repository": {
