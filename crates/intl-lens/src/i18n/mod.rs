@@ -1,4 +1,5 @@
 pub mod key_finder;
+mod next_intl;
 pub mod parser;
 pub mod store;
 

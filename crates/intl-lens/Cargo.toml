@@ -44,6 +44,8 @@ dashmap.workspace = true
 regex.workspace = true
 globset.workspace = true
 walkdir.workspace = true
+tree-sitter = "0.26.11"
+tree-sitter-typescript = "0.23.2"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 indicatif = "0.17"

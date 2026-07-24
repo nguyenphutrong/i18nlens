@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use regex::Regex;
 
+use super::next_intl;
+
 #[derive(Debug, Clone)]
 pub struct FoundKey {
     pub key: String,
@@ -13,19 +15,6 @@ pub struct FoundKey {
 
 pub struct KeyFinder {
     patterns: Vec<Regex>,
-}
-
-/// A next-intl translator declaration (`const t = useTranslations(...)`) with
-/// the lexical scope over which it is visible.
-struct Declaration {
-    /// Byte offset just past the declaration; call sites must appear at or
-    /// after this to bind to it.
-    declaration_end: usize,
-    /// Byte offset of the enclosing block's closing brace — the end of the
-    /// declaration's lexical scope.
-    scope_end: usize,
-    /// Resolved namespace, empty for an unscoped translator.
-    namespace: String,
 }
 
 impl KeyFinder {
@@ -62,12 +51,20 @@ impl KeyFinder {
             }
         }
 
-        let scoped_keys = Self::find_next_intl_translator_keys(content);
-        if !scoped_keys.is_empty() {
-            let scoped_offsets: HashSet<usize> =
-                scoped_keys.iter().map(|key| key.start_offset).collect();
-            found_keys.retain(|key| !scoped_offsets.contains(&key.start_offset));
-            found_keys.extend(scoped_keys);
+        let analysis = next_intl::analyze(content);
+        let ast_offsets: HashSet<_> = analysis.claimed_offsets.into_iter().collect();
+        found_keys.retain(|key| !ast_offsets.contains(&key.start_offset));
+
+        for candidate in analysis.candidates {
+            let (line, start_char, end_char) =
+                Self::offset_to_position(content, candidate.start, candidate.end);
+            found_keys.push(FoundKey {
+                key: candidate.key,
+                start_offset: candidate.start,
+                line,
+                start_char,
+                end_char,
+            });
         }
 
         found_keys.sort_by_key(|k| k.start_offset);
@@ -105,140 +102,10 @@ impl KeyFinder {
             }
         }
 
-        let start_char = start_offset - line_start;
-        let end_char = end_offset - line_start;
+        let start_char = content[line_start..start_offset].encode_utf16().count();
+        let end_char = content[line_start..end_offset].encode_utf16().count();
 
         (line, start_char, end_char)
-    }
-
-    /// Byte offset of the closing brace of the block enclosing `from`, i.e.
-    /// the point where a declaration made at `from` goes out of scope. Scans
-    /// forward tracking brace depth and returns the first `}` seen at depth
-    /// zero; declarations at module top level (no enclosing block) scope to the
-    /// end of the file. Braces inside strings or comments are not distinguished
-    /// — a deliberately shallow heuristic matching the regex-based approach
-    /// used elsewhere here.
-    fn enclosing_block_end(content: &str, from: usize) -> usize {
-        let mut depth = 0usize;
-        for (offset, byte) in content.bytes().enumerate().skip(from) {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    if depth == 0 {
-                        return offset;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
-            }
-        }
-        content.len()
-    }
-
-    fn find_next_intl_translator_keys(content: &str) -> Vec<FoundKey> {
-        // Matches translator declarations with a string namespace, an object
-        // argument (e.g. `getTranslations({ locale, namespace: "X" })`), or no
-        // argument at all (unscoped translator called with full keys).
-        let Ok(translator_regex) = Regex::new(
-            r#"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:useTranslations|getTranslations)\s*\(\s*(?:["']([^"']*)["']|(\{[^{}]*\}))?\s*\)"#,
-        ) else {
-            return Vec::new();
-        };
-        let Ok(namespace_prop_regex) = Regex::new(r#"namespace\s*:\s*["']([^"']+)["']"#) else {
-            return Vec::new();
-        };
-
-        // Collect declarations grouped by variable name. The same variable is
-        // often redeclared per component in one file, possibly with different
-        // namespaces, so each call site must resolve against the nearest
-        // preceding declaration *that is still in scope* rather than every
-        // declaration. Each declaration carries the byte offset of its
-        // enclosing block's closing brace (`scope_end`); a call is only bound
-        // to a declaration when it falls within that lexical scope. This keeps
-        // a `const t = useTranslations("Header")` in one component from
-        // capturing a `t` received via props in a later component.
-        let mut translators: Vec<(&str, Vec<Declaration>)> = Vec::new();
-        for translator in translator_regex.captures_iter(content) {
-            let Some(variable_match) = translator.get(1) else {
-                continue;
-            };
-
-            let variable = variable_match.as_str();
-            let namespace = translator
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .or_else(|| {
-                    translator.get(3).and_then(|object_arg| {
-                        namespace_prop_regex
-                            .captures(object_arg.as_str())
-                            .map(|cap| cap[1].to_string())
-                    })
-                })
-                .unwrap_or_default();
-            let declaration_end = translator.get(0).map(|m| m.end()).unwrap_or(0);
-            let scope_end = Self::enclosing_block_end(content, declaration_end);
-            let declaration = Declaration {
-                declaration_end,
-                scope_end,
-                namespace,
-            };
-
-            match translators.iter_mut().find(|(v, _)| *v == variable) {
-                Some((_, declarations)) => declarations.push(declaration),
-                None => translators.push((variable, vec![declaration])),
-            }
-        }
-
-        let mut found_keys = Vec::new();
-
-        for (variable, declarations) in translators {
-            let call_pattern = format!(
-                r#"(?:^|[^\w.]){}(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#,
-                regex::escape(variable)
-            );
-            let Ok(call_regex) = Regex::new(&call_pattern) else {
-                continue;
-            };
-
-            for call in call_regex.captures_iter(content) {
-                let Some(key_match) = call.get(1) else {
-                    continue;
-                };
-
-                // Nearest declaration of this variable that precedes the call
-                // site *and* whose lexical scope still covers it. When none
-                // qualifies (e.g. the translator was received via props), the
-                // call is left to the generic unscoped pattern, which reports
-                // the literal (full) key.
-                let call_start = key_match.start();
-                let Some(declaration) = declarations.iter().rev().find(|decl| {
-                    decl.declaration_end <= call_start && call_start <= decl.scope_end
-                }) else {
-                    continue;
-                };
-                let namespace = &declaration.namespace;
-
-                let key = if namespace.is_empty() {
-                    key_match.as_str().to_string()
-                } else {
-                    format!("{}.{}", namespace, key_match.as_str())
-                };
-                let start_offset = key_match.start();
-                let end_offset = key_match.end();
-                let (line, start_char, end_char) =
-                    Self::offset_to_position(content, start_offset, end_offset);
-
-                found_keys.push(FoundKey {
-                    key,
-                    start_offset,
-                    line,
-                    start_char,
-                    end_char,
-                });
-            }
-        }
-
-        found_keys
     }
 }
 
@@ -250,9 +117,7 @@ impl Default for KeyFinder {
 
 fn default_patterns() -> Vec<String> {
     vec![
-        // JavaScript/TypeScript patterns
-        // Match t()/t.rich()/t.markup()/t.raw()/t.has() but not .post(), .get(), etc.
-        r#"(?:^|[^\w.])t(?:\.(?:rich|markup|raw|has))?\s*\(\s*["']([^"']+)["']"#.to_string(),
+        // JavaScript/TypeScript patterns (`t` is handled by the TSX parser)
         r#"i18n\.t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$tc\s*\(\s*["']([^"']+)["']"#.to_string(),
@@ -572,6 +437,402 @@ mod tests {
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_ignores_braces_in_strings() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Hero() {
+                const t = useTranslations("Landing.Hero");
+                const markers = ["}", '}', `}`];
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_ignores_braces_in_comments() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Hero() {
+                const t = useTranslations("Landing.Hero");
+                // }
+                /* } */
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_ignores_braces_in_regex_literals() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Hero() {
+                const t = useTranslations("Landing.Hero");
+                const closingBrace = /[}]/;
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_ignores_translator_declarations_in_comments_and_strings() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Hero() {
+                const t = useTranslations("Landing.Hero");
+                // const t = useTranslations("Comment");
+                const example = `const t = useTranslations("String")`;
+                return <h1>{t("Title")}</h1>;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_scoped_translator_handles_nested_template_literals() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Hero(flag) {
+                const t = useTranslations("Landing.Hero");
+                const marker = `${flag ? `}` : ""}`;
+                return `${t("Title")} ${marker}`;
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Hero.Title");
+    }
+
+    #[test]
+    fn test_callback_parameter_shadows_scoped_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Page(items) {
+                const t = useTranslations("Page");
+                return items.map((t) => t("Item.Title"));
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Item.Title");
+    }
+
+    #[test]
+    fn test_unparenthesized_arrow_parameter_shadows_scoped_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Page(items) {
+                const t = useTranslations("Page");
+                return items.map(t => t("Item.Title"));
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Item.Title");
+    }
+
+    #[test]
+    fn test_local_binding_shadows_scoped_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            function Page() {
+                const t = useTranslations("Page");
+                if (preview) {
+                    const t = makePreviewTranslator();
+                    return t("Preview.Title");
+                }
+                return t("Title");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Preview.Title");
+        assert_eq!(keys[1].key, "Page.Title");
+    }
+
+    #[test]
+    fn test_var_translator_is_function_scoped() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            async function Page(enabled) {
+                if (enabled) {
+                    var t = await getTranslations("Page");
+                }
+                return t("Title");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Page.Title");
+    }
+
+    #[test]
+    fn test_var_translator_does_not_apply_before_assignment() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            async function Page() {
+                t("Before.Assignment");
+                var t = await getTranslations("Page");
+                return t("Title");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Before.Assignment");
+        assert_eq!(keys[1].key, "Page.Title");
+    }
+
+    #[test]
+    fn test_static_keys_allow_other_and_escaped_quotes() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = useTranslations();
+            t("don't");
+            t('say "hi"');
+            t("say \"hello\"");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].key, "don't");
+        assert_eq!(keys[1].key, "say \"hi\"");
+        assert_eq!(keys[2].key, "say \"hello\"");
+    }
+
+    #[test]
+    fn test_ast_result_takes_precedence_over_configured_t_regex() {
+        let finder = KeyFinder::new(&[r#"(?:^|[^\w.])t\s*\(\s*["']([^"']+)["']"#.to_string()]);
+        let content = r#"
+            const t = useTranslations("Landing");
+            t("Title");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Landing.Title");
+    }
+
+    #[test]
+    fn test_unknown_namespaces_do_not_invent_translation_keys() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const dynamic = useTranslations(namespace);
+            dynamic("Dynamic.Title");
+            const template = useTranslations(`Template`);
+            template("Template.Title");
+            const shorthand = useTranslations({namespace});
+            shorthand("Shorthand.Title");
+            const spread = useTranslations({...options});
+            spread("Spread.Title");
+            const overridden = useTranslations({namespace: "Known", ...options});
+            overridden("Overridden.Title");
+            const known = useTranslations({...options, namespace: "Known"});
+            known("Title");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Known.Title");
+    }
+
+    #[test]
+    fn test_function_and_catch_bindings_shadow_outer_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const tr = useTranslations("Outer");
+            function page() {
+                tr("Function.Title");
+                function tr() {}
+            }
+            const callback = function tr() {
+                return tr("Expression.Title");
+            };
+            try {
+                run();
+            } catch (tr) {
+                tr("Catch.Title");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    fn test_scope_end_is_exclusive_without_whitespace() {
+        let finder = KeyFinder::default();
+        let content = r#"const t=makeTranslator();function A(){const t=useTranslations("A");t("Inside")}t("Outside")"#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "A.Inside");
+        assert_eq!(keys[1].key, "Outside");
+    }
+
+    #[test]
+    fn test_method_name_does_not_shadow_outer_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const tr = useTranslations("Outer");
+            class View {
+                tr() {
+                    return tr("Title");
+                }
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Outer.Title");
+    }
+
+    #[test]
+    fn test_later_static_namespace_overrides_dynamic_namespace() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = getTranslations({
+                namespace: selectedNamespace,
+                namespace: "Known",
+            });
+            t("Title");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Known.Title");
+    }
+
+    #[test]
+    fn test_custom_translator_claims_only_its_lexical_scope() {
+        let finder = KeyFinder::new(&[r#"translate\(\s*["']([^"']+)["']"#.to_string()]);
+        let content = r#"
+            function A() {
+                const translate = useTranslations("A");
+                return translate("One");
+            }
+            function B() {
+                return translate("External");
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "A.One");
+        assert_eq!(keys[1].key, "External");
+    }
+
+    #[test]
+    fn test_all_supported_translator_methods_and_property_exclusions() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = useTranslations("Page");
+            t.markup("Markup");
+            t.raw("Raw");
+            t.has("Has");
+            props.t("Ignored.Prop");
+            this.t.rich("Ignored.This");
+            object.t("Ignored.Object");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].key, "Page.Markup");
+        assert_eq!(keys[1].key, "Page.Raw");
+        assert_eq!(keys[2].key, "Page.Has");
+    }
+
+    #[test]
+    fn test_method_parameter_shadows_outer_translator() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const tr = useTranslations("Outer");
+            class Preview {
+                render(tr = fallback) {
+                    return tr("Preview.Title");
+                }
+            }
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    fn test_escaped_key_offsets_and_utf16_positions() {
+        let finder = KeyFinder::default();
+        let content = "const t = useTranslations();\n\"😀\"; t(\"say \\\"hi\\\"\");";
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        let key = &keys[0];
+        assert_eq!(key.key, "say \"hi\"");
+        assert_eq!(
+            &content[key.start_offset..key.start_offset + 10],
+            r#"say \"hi\""#
+        );
+        assert_eq!(key.line, 1, "{key:?}");
+        assert_eq!(key.start_char, 9);
+        assert_eq!(key.end_char, 19);
+    }
+
+    #[test]
+    fn test_ignores_translation_calls_in_comments_and_strings() {
+        let finder = KeyFinder::default();
+        let content = r#"
+            const t = useTranslations("Page");
+            // t("CommentedOut");
+            const example = `t("StringExample")`;
+            t("Title");
+        "#;
+
+        let keys = finder.find_keys(content);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "Page.Title");
     }
 
     #[test]

@@ -1291,8 +1291,10 @@ impl LanguageServer for I18nBackend {
 
                 let mut hint_char = found_key.end_char;
                 if let Some(line) = content.lines().nth(found_key.line) {
-                    let line_bytes = line.as_bytes();
-                    if matches!(line_bytes.get(hint_char), Some(b'\'') | Some(b'"')) {
+                    if matches!(
+                        line.encode_utf16().nth(hint_char),
+                        Some(unit) if unit == b'\'' as u16 || unit == b'"' as u16
+                    ) {
                         hint_char += 1;
                     }
                 }
