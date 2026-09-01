@@ -48,6 +48,22 @@ impl IntlLensExtension {
             return Ok(path);
         }
 
+        let (platform, arch) = zed::current_platform();
+
+        let binary_path = match Self::download_latest(language_server_id, platform, arch) {
+            Ok(path) => path,
+            Err(err) => Self::newest_installed_binary(platform).ok_or(err)?,
+        };
+
+        self.cached_binary_path = Some(binary_path.clone());
+        Ok(binary_path)
+    }
+
+    fn download_latest(
+        language_server_id: &LanguageServerId,
+        platform: zed::Os,
+        arch: zed::Architecture,
+    ) -> Result<String> {
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
@@ -61,7 +77,6 @@ impl IntlLensExtension {
             },
         )?;
 
-        let (platform, arch) = zed::current_platform();
         let asset_name = format!(
             "i18nlens-{}-{}.{}",
             match arch {
@@ -111,8 +126,41 @@ impl IntlLensExtension {
             zed::make_file_executable(&binary_path)?;
         }
 
-        self.cached_binary_path = Some(binary_path.clone());
         Ok(binary_path)
+    }
+
+    /// Finds the newest already-downloaded server binary, so that a failed
+    /// release check (e.g. an anonymous GitHub API rate limit 403 on a shared
+    /// IP) doesn't prevent an installed server from starting.
+    fn newest_installed_binary(platform: zed::Os) -> Option<String> {
+        let suffix = match platform {
+            zed::Os::Windows => ".exe",
+            _ => "",
+        };
+
+        std::fs::read_dir(".")
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let dir_name = entry.file_name().into_string().ok()?;
+                // Version dirs downloaded by extension versions before the
+                // rename use the `intl-lens-` prefix and binary name.
+                let server_name = ["i18nlens", "intl-lens"]
+                    .into_iter()
+                    .find(|name| dir_name.starts_with(&format!("{name}-")))?;
+                let version = dir_name[server_name.len() + 1..]
+                    .trim_start_matches('v')
+                    .split('.')
+                    .map(|part| part.parse::<u32>().ok())
+                    .collect::<Option<Vec<u32>>>()?;
+
+                let binary_path = format!("{dir_name}/{server_name}{suffix}");
+                std::fs::metadata(&binary_path)
+                    .is_ok()
+                    .then_some((version, binary_path))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, binary_path)| binary_path)
     }
 }
 
