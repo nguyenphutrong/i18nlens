@@ -33,7 +33,17 @@ impl CodeScanner {
         let mut scanned_files = Vec::new();
 
         // Supported file extensions
-        let extensions = ["ts", "tsx", "js", "jsx", "vue", "php", "blade.php", "dart"];
+        let extensions = [
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "vue",
+            "php",
+            "blade.php",
+            "dart",
+            "svelte",
+        ];
 
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
