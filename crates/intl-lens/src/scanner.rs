@@ -122,3 +122,42 @@ impl CodeScanner {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::I18nConfig;
+
+    fn scanner() -> CodeScanner {
+        CodeScanner::new(&I18nConfig::default().function_patterns)
+    }
+
+    #[test]
+    fn scans_svelte_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Greeting.svelte");
+        std::fs::write(
+            &file,
+            "<script>\n  import { _ } from 'svelte-i18n';\n</script>\n\n<h1>{$_('home.title')}</h1>\n",
+        )
+        .unwrap();
+
+        let scanned = scanner().scan_directory(dir.path());
+
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].path, file);
+        assert_eq!(scanned[0].found_keys.len(), 1);
+        assert_eq!(scanned[0].found_keys[0].key, "home.title");
+        assert_eq!(scanned[0].found_keys[0].line, 4);
+    }
+
+    #[test]
+    fn skips_unsupported_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "{$_('home.title')}").unwrap();
+
+        let scanned = scanner().scan_directory(dir.path());
+
+        assert!(scanned.is_empty());
+    }
+}
