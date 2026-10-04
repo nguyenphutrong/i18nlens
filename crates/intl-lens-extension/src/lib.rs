@@ -1,6 +1,8 @@
 use zed_extension_api::http_client::{HttpMethod, HttpRequest, RedirectPolicy};
 use zed_extension_api::{self as zed, LanguageServerId, Result, Worktree};
 
+mod binary;
+
 const GITHUB_REPO_URL: &str = "https://github.com/nguyenphutrong/i18nlens";
 
 struct IntlLensExtension {
@@ -35,11 +37,13 @@ impl IntlLensExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<String> {
+        let (platform, arch) = zed::current_platform();
         if let Some(path) = &self.cached_binary_path {
-            if std::fs::metadata(path).is_ok() {
+            if Self::prepare_binary(path, platform, arch).is_ok() {
                 return Ok(path.clone());
             }
         }
+        self.cached_binary_path = None;
 
         if let Some(path) = worktree.which("i18nlens") {
             self.cached_binary_path = Some(path.clone());
@@ -51,11 +55,14 @@ impl IntlLensExtension {
             return Ok(path);
         }
 
-        let (platform, arch) = zed::current_platform();
-
         let binary_path = match Self::download_latest(language_server_id, platform, arch) {
             Ok(path) => path,
-            Err(err) => Self::newest_installed_binary(platform).ok_or(err)?,
+            Err(err) => {
+                binary::newest_installed_binary(std::path::Path::new("."), platform, |path| {
+                    Self::prepare_binary(path, platform, arch)
+                })
+                .ok_or(err)?
+            }
         };
 
         self.cached_binary_path = Some(binary_path.clone());
@@ -101,26 +108,26 @@ impl IntlLensExtension {
             }
         );
 
-        if std::fs::metadata(&binary_path).is_err() {
-            zed::set_language_server_installation_status(
-                language_server_id,
-                &zed::LanguageServerInstallationStatus::Downloading,
-            );
-
-            let file_type = match platform {
-                zed::Os::Windows => zed::DownloadedFileType::Zip,
-                _ => zed::DownloadedFileType::GzipTar,
-            };
-
-            zed::download_file(
-                &format!("{download_url_base}/{asset_name}"),
-                &version_dir,
-                file_type,
-            )?;
-
-            zed::make_file_executable(&binary_path)?;
+        if Self::prepare_binary(&binary_path, platform, arch).is_ok() {
+            return Ok(binary_path);
         }
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
 
+        let file_type = match platform {
+            zed::Os::Windows => zed::DownloadedFileType::Zip,
+            _ => zed::DownloadedFileType::GzipTar,
+        };
+
+        zed::download_file(
+            &format!("{download_url_base}/{asset_name}"),
+            &version_dir,
+            file_type,
+        )?;
+
+        Self::prepare_binary(&binary_path, platform, arch)?;
         Ok(binary_path)
     }
 
@@ -160,38 +167,8 @@ impl IntlLensExtension {
         Err("too many redirects while resolving the latest release".into())
     }
 
-    /// Finds the newest already-downloaded server binary, so that a failed
-    /// release check (e.g. an anonymous GitHub API rate limit 403 on a shared
-    /// IP) doesn't prevent an installed server from starting.
-    fn newest_installed_binary(platform: zed::Os) -> Option<String> {
-        let suffix = match platform {
-            zed::Os::Windows => ".exe",
-            _ => "",
-        };
-
-        std::fs::read_dir(".")
-            .ok()?
-            .flatten()
-            .filter_map(|entry| {
-                let dir_name = entry.file_name().into_string().ok()?;
-                // Version dirs downloaded by extension versions before the
-                // rename use the `intl-lens-` prefix and binary name.
-                let server_name = ["i18nlens", "intl-lens"]
-                    .into_iter()
-                    .find(|name| dir_name.starts_with(&format!("{name}-")))?;
-                let version = dir_name[server_name.len() + 1..]
-                    .trim_start_matches('v')
-                    .split('.')
-                    .map(|part| part.parse::<u32>().ok())
-                    .collect::<Option<Vec<u32>>>()?;
-
-                let binary_path = format!("{dir_name}/{server_name}{suffix}");
-                std::fs::metadata(&binary_path)
-                    .is_ok()
-                    .then_some((version, binary_path))
-            })
-            .max_by(|a, b| a.0.cmp(&b.0))
-            .map(|(_, binary_path)| binary_path)
+    fn prepare_binary(path: &str, platform: zed::Os, arch: zed::Architecture) -> Result<()> {
+        binary::prepare_binary(path, platform, arch, zed::make_file_executable)
     }
 }
 

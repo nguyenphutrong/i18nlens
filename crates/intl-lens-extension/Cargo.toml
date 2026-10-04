@@ -10,3 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 zed_extension_api.workspace = true
+object = { version = "0.40", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
+
+[dev-dependencies]
+tempfile = "3"
