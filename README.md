@@ -45,6 +45,8 @@ bunx @i18nlens/cli fix --to-nested
 
 The extension launches the `i18nlens` language server.
 
+The extension checks for updates through GitHub's release page. Before reusing a downloaded server, it checks the executable format, architecture, and file ranges, then sets execute permissions. If an update check or download fails, it tries installed versions from newest to oldest, including `intl-lens` installs. It skips incomplete files or versions whose permissions cannot be set. If none can be prepared, it returns the original update or download error.
+
 ### Build from Source
 
 ```bash
